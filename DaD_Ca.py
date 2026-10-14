@@ -1,14 +1,3 @@
-"""DaD-Ca model architecture (PyTorch).
-
-This module contains only the neural network definition and its internal
-loss computation helpers. No dataset loading, preprocessing, training loop,
-evaluation, visualization, file paths, or experiment outputs are included.
-
-Input: EEG differential-entropy features, [batch, 1, time=5, channels, bands=5].
-Outputs: class logits and, in training mode, domain/decoupling losses.
-The DSFE input is the residual (aligned incoming features - invariant features).
-"""
-
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -71,7 +60,10 @@ class SSTAttentionBlock(nn.Module):
         if spaFreAtt.dim() == 4 and spaFreAtt.size(1) == 1:
             spaFreAtt = spaFreAtt.squeeze(1)
         tem_seq = rearrange(temAtt, '(b c) t s f -> b (t s f) c', b=B, c=C)
-        spa_seq = rearrange(spaFreAtt, '(b c) s f -> b (s f) c', b=B, c=C)
+        # Manuscript Eq. (16): X_sf = X * A_sf.  The attention map is
+        # broadcast over T; temporal mean pooling then yields S*F K/V tokens.
+        sf_features = (x_flat * spaFreAtt.unsqueeze(1)).mean(dim=1)
+        spa_seq = rearrange(sf_features, '(b c) s f -> b (s f) c', b=B, c=C)
         Q = self.q_proj(tem_seq)
         K = self.k_proj(spa_seq)
         V = self.v_proj(spa_seq)
@@ -272,24 +264,35 @@ class DA_ada_3d(nn.Module):
         return self.get_features(x)
 
 
-def offdiag_cov_decouple_loss_v2(h_inv, h_sp, target_dim=128, standardize=True, eps=1e-06):
-    B, D = h_inv.shape
-    if D > target_dim:
+def cross_correlation_decoupling_loss(h_inv, h_sp, target_dim=128,
+                                     standardize=True, eps=1e-6):
+    """Full cross-correlation penalty in manuscript Sec. III-F, Eqs. 24-27.
+
+    Each input is [batch, features]. For computational feasibility, long
+    flattened feature vectors are pooled to `target_dim` first.  The paper's
+    correlation matrix is C = h_sp.T @ h_inv / (B - 1), shape [D, D], and
+    the loss penalizes every entry: ||C||_F^2 / D^2.
+    """
+    if h_inv.ndim != 2 or h_sp.ndim != 2 or h_inv.shape != h_sp.shape:
+        raise ValueError("Expected two equal [batch, features] tensors")
+    batch_size, feature_dim = h_inv.shape
+    if batch_size < 2:
+        # Avoid undefined sample standard deviation for singleton batches.
+        return (h_inv.sum() + h_sp.sum()) * 0.0
+
+    if feature_dim > target_dim:
         h_inv = F.adaptive_avg_pool1d(h_inv.unsqueeze(1), target_dim).squeeze(1)
         h_sp = F.adaptive_avg_pool1d(h_sp.unsqueeze(1), target_dim).squeeze(1)
-        D = target_dim
+        feature_dim = target_dim
+
     h_inv = h_inv - h_inv.mean(dim=0, keepdim=True)
     h_sp = h_sp - h_sp.mean(dim=0, keepdim=True)
     if standardize:
         h_inv = h_inv / (h_inv.std(dim=0, unbiased=True, keepdim=True) + eps)
         h_sp = h_sp / (h_sp.std(dim=0, unbiased=True, keepdim=True) + eps)
-    HH = h_sp @ h_inv.T
-    total_frob2 = HH.pow(2).sum() / ((B - 1) ** 2 + eps)
-    diag_dot = (h_inv * h_sp).sum(dim=0) / (B - 1 + eps)
-    diag_sq_sum = diag_dot.pow(2).sum()
-    offdiag_frob2 = torch.max(total_frob2 - diag_sq_sum, torch.tensor(0.0, device=h_inv.device))
-    loss = offdiag_frob2 / (D * D + eps)
-    return loss
+
+    cross_correlation = h_sp.T @ h_inv / (batch_size - 1)
+    return cross_correlation.square().sum() / (feature_dim * feature_dim)
 
 
 class DANNModel(nn.Module):
@@ -318,11 +321,9 @@ class DANNModel(nn.Module):
             for layer in ['res2', 'res3']:
                 h_i = dia_feat[layer].flatten(1)
                 h_s = dsa_feat[layer].flatten(1)
-                target_dim = 128
-                if h_i.size(1) > target_dim:
-                    h_i = F.adaptive_avg_pool1d(h_i, target_dim)
-                    h_s = F.adaptive_avg_pool1d(h_s, target_dim)
-                decouple_loss += offdiag_cov_decouple_loss_v2(h_i, h_s, standardize=True)
+                decouple_loss += cross_correlation_decoupling_loss(
+                    h_i, h_s, target_dim=128, standardize=True
+                )
             return (class_output, domain_loss, decouple_loss)
         else:
             device = x.device
