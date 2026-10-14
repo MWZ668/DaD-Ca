@@ -288,7 +288,7 @@ def offdiag_cov_decouple_loss_v2(h_inv, h_sp, target_dim=128, standardize=True, 
     diag_dot = (h_inv * h_sp).sum(dim=0) / (B - 1 + eps)
     diag_sq_sum = diag_dot.pow(2).sum()
     offdiag_frob2 = torch.max(total_frob2 - diag_sq_sum, torch.tensor(0.0, device=h_inv.device))
-    loss = offdiag_frob2 / (D * (D - 1) + eps)
+    loss = offdiag_frob2 / (D * D + eps)
     return loss
 
 
